@@ -1,9 +1,13 @@
 import streamlit as st
 import pandas as pd
+import altair as alt
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
+import hashlib
+import hmac
 import uuid
 
 # =============================================================================
@@ -32,21 +36,44 @@ LOGO_URL = ""
 # (el servidor de Streamlit Cloud trabaja en hora UTC).
 ZONA_HORARIA = "America/Bogota"
 
+# Un producto se marca con "stock bajo" cuando le quedan estas unidades o menos.
+STOCK_BAJO = 3
+
+# Secciones del menú que solo puede ver el administrador (requieren clave).
+# El resto queda disponible para cualquier usuario.
+SECCIONES_ADMIN = ["📊 Finanzas", "⚙️ Gestión"]
+
+# Clave del administrador, guardada como huella SHA-256 (no en texto) porque
+# este archivo vive en GitHub. Para cambiarla sin tocar el código, agrega en
+# los Secrets de Streamlit Cloud una línea:  clave_admin = "tu_nueva_clave"
+CLAVE_ADMIN_HASH = "b9af0038d4b32a24482078819f5f9ba74533d9a4e1416655ed17cc52f2a1d268"
+
 # =============================================================================
 # A PARTIR DE AQUÍ NO NECESITAS MODIFICAR NADA (a menos que quieras adaptar
 # la lógica del negocio, agregar campos, etc.)
 # =============================================================================
 
+# Si no hay LOGO_URL, se usa el archivo logo.png que está junto a app.py.
+LOGO_LOCAL = Path(__file__).parent / "logo.png"
+LOGO = LOGO_URL or (str(LOGO_LOCAL) if LOGO_LOCAL.exists() else "")
+
+# Colores de las gráficas (ventas / gastos).
+COLOR_VENTAS = "#C2692B"
+COLOR_GASTOS = "#2A78B5"
+
 st.set_page_config(
     page_title=NOMBRE_APP,
-    page_icon=ICONO_APP,
+    page_icon=LOGO or ICONO_APP,
     layout="wide"
 )
 
 # --- LOGO EN LA BARRA LATERAL ---
-if LOGO_URL:
-    st.sidebar.image(LOGO_URL, width="stretch")
-st.sidebar.title("Menú de Navegación")
+if LOGO:
+    _, col_logo, _ = st.sidebar.columns([1, 4, 1])
+    col_logo.image(LOGO, width="stretch")
+    # Recorta el logo en círculo para que no se vea su fondo sobre la barra oscura.
+    st.markdown('<style>[data-testid="stSidebar"] [data-testid="stImage"] img {border-radius: 50%;}</style>', unsafe_allow_html=True)
+st.sidebar.subheader("Menú")
 
 
 # --- CONEXIÓN A GOOGLE SHEETS ---
@@ -121,6 +148,37 @@ def avisar(mensaje):
     """Guarda un mensaje de éxito para mostrarlo después de recargar la página."""
     st.session_state.aviso = mensaje
 
+def clave_admin_correcta(clave):
+    """Valida la clave del administrador contra Secrets o, si no hay, contra CLAVE_ADMIN_HASH."""
+    try:
+        clave_secreta = st.secrets.get("clave_admin")
+    except Exception:
+        clave_secreta = None
+    if clave_secreta:
+        return hmac.compare_digest(clave.encode(), str(clave_secreta).encode())
+    return hmac.compare_digest(hashlib.sha256(clave.encode()).hexdigest(), CLAVE_ADMIN_HASH)
+
+def fmt_dinero(valor):
+    """Formatea un valor como pesos: $ 64.000"""
+    try:
+        return f"$ {float(valor):,.0f}".replace(",", ".")
+    except (TypeError, ValueError):
+        return valor
+
+def tabla(df, dinero=(), contenedor=st):
+    """Muestra una tabla sin índice y con las columnas de dinero formateadas."""
+    columnas = [c for c in dinero if c in df.columns]
+    datos = df.style.format({c: fmt_dinero for c in columnas}) if columnas and not df.empty else df
+    contenedor.dataframe(datos, width="stretch", hide_index=True)
+
+def estado_stock(unidades):
+    """Etiqueta visual del nivel de existencias."""
+    if unidades <= 0:
+        return "🔴 Agotado"
+    if unidades <= STOCK_BAJO:
+        return "🟡 Bajo"
+    return "🟢 Disponible"
+
 def suma(df, columna):
     """Suma una columna numérica; devuelve 0 si la columna no existe."""
     if columna not in df.columns:
@@ -192,18 +250,44 @@ if 'compra_actual' not in st.session_state:
     st.session_state.compra_actual = []
 if 'venta_actual' not in st.session_state:
     st.session_state.venta_actual = []
+if 'es_admin' not in st.session_state:
+    st.session_state.es_admin = False
 
 # --- INTERFAZ DE LA APLICACIÓN ---
-st.title(f"{ICONO_APP} {NOMBRE_APP}")
+st.title(NOMBRE_APP)
 
 if 'aviso' in st.session_state:
     st.success(st.session_state.pop('aviso'))
     st.balloons()
 
-opcion = st.sidebar.radio(
-    "Selecciona una opción:",
-    ["📈 Ver Inventario", "💰 Registrar Venta", "🛒 Registrar Compra", "🎁 Registrar Obsequio", "📊 Finanzas", "🧾 Cuentas por Cobrar", "⚙️ Gestión"]
-)
+secciones = ["📈 Ver Inventario", "💰 Registrar Venta", "🛒 Registrar Compra", "🎁 Registrar Obsequio", "📊 Finanzas", "🧾 Cuentas por Cobrar", "⚙️ Gestión"]
+if not st.session_state.es_admin:
+    secciones = [s for s in secciones if s not in SECCIONES_ADMIN]
+
+opcion = st.sidebar.radio("Selecciona una opción:", secciones)
+
+# --- ACCESO DE ADMINISTRADOR ---
+st.sidebar.markdown("---")
+if st.session_state.es_admin:
+    st.sidebar.success("👑 Administrador")
+    if st.sidebar.button("Cerrar sesión"):
+        st.session_state.es_admin = False
+        st.rerun()
+else:
+    st.sidebar.caption("👤 Usuario")
+    with st.sidebar.expander("🔐 Acceso administrador"):
+        with st.form("acceso_admin_form", clear_on_submit=True):
+            clave_ingresada = st.text_input("Clave", type="password")
+            if st.form_submit_button("Entrar", type="primary"):
+                if clave_admin_correcta(clave_ingresada):
+                    st.session_state.es_admin = True
+                    st.rerun()
+                else:
+                    st.error("Clave incorrecta.")
+
+if opcion in SECCIONES_ADMIN and not st.session_state.es_admin:
+    st.error("Esta sección es solo para el administrador.")
+    st.stop()
 
 # --- PESTAÑA DE GESTIÓN ---
 if opcion == "⚙️ Gestión":
@@ -218,7 +302,7 @@ if opcion == "⚙️ Gestión":
             tallas = st.text_input("Tallas Disponibles (separadas por coma, ej: S,M,L)")
             precio = st.number_input("Precio de Venta por Defecto", min_value=0.0, format="%.2f")
             costo = st.number_input("Costo de Compra por Defecto", min_value=0.0, format="%.2f")
-            if st.form_submit_button("Añadir Producto"):
+            if st.form_submit_button("Añadir Producto", type="primary"):
                 nombre, tallas = nombre.strip(), tallas.strip()
                 if nombre and tallas:
                     sheets["productos"].append_row([nombre, tallas, precio, costo])
@@ -228,13 +312,13 @@ if opcion == "⚙️ Gestión":
                 else:
                     st.warning("Nombre y Tallas son campos obligatorios.")
         st.subheader("Lista de Productos Actual")
-        st.dataframe(productos_df, width="stretch")
+        tabla(productos_df, dinero=['PrecioVentaDefecto', 'CostoCompraDefecto'])
 
     with tab2:
         st.subheader("Añadir Nuevo Cliente")
         with st.form("nuevo_cliente_form", clear_on_submit=True):
             nombre = st.text_input("Nombre del Nuevo Cliente")
-            if st.form_submit_button("Añadir Cliente"):
+            if st.form_submit_button("Añadir Cliente", type="primary"):
                 nombre = nombre.strip()
                 if nombre:
                     sheets["clientes"].append_row([nombre])
@@ -244,13 +328,13 @@ if opcion == "⚙️ Gestión":
                 else:
                     st.warning("El nombre del cliente no puede estar vacío.")
         st.subheader("Lista de Clientes Actual")
-        st.dataframe(clientes_df, width="stretch")
+        tabla(clientes_df)
 
     with tab3:
         st.subheader("Añadir Nuevo Proveedor")
         with st.form("nuevo_proveedor_form", clear_on_submit=True):
             nombre = st.text_input("Nombre del Nuevo Proveedor")
-            if st.form_submit_button("Añadir Proveedor"):
+            if st.form_submit_button("Añadir Proveedor", type="primary"):
                 nombre = nombre.strip()
                 if nombre:
                     sheets["proveedores"].append_row([nombre])
@@ -260,19 +344,20 @@ if opcion == "⚙️ Gestión":
                 else:
                     st.warning("El nombre del proveedor no puede estar vacío.")
         st.subheader("Lista de Proveedores Actual")
-        st.dataframe(proveedores_df, width="stretch")
+        tabla(proveedores_df)
 
 # --- PESTAÑA DE VENTAS ---
 elif opcion == "💰 Registrar Venta":
-    st.header("Formulario de Registro de Ventas")
+    st.header("Registrar Venta")
 
-    st.subheader("Paso 1: Elige el Cliente")
-    col1, col2 = st.columns([2, 2])
-    with col1:
-        lista_clientes = [""] + clientes_df['NombreCliente'].tolist()
-        cliente_existente = st.selectbox("Selecciona un Cliente Existente", options=lista_clientes, help="Elige un cliente de tu lista.")
-    with col2:
-        cliente_nuevo = st.text_input("O añade un Cliente Nuevo aquí", help="Si el cliente no existe, escríbelo aquí.").strip()
+    with st.container(border=True):
+        st.subheader("Paso 1: Elige el Cliente")
+        col1, col2 = st.columns([2, 2])
+        with col1:
+            lista_clientes = [""] + clientes_df['NombreCliente'].tolist()
+            cliente_existente = st.selectbox("Selecciona un Cliente Existente", options=lista_clientes, help="Elige un cliente de tu lista.")
+        with col2:
+            cliente_nuevo = st.text_input("O añade un Cliente Nuevo aquí", help="Si el cliente no existe, escríbelo aquí.").strip()
 
     cliente_final = cliente_nuevo if cliente_nuevo else cliente_existente
 
@@ -301,7 +386,7 @@ elif opcion == "💰 Registrar Venta":
         if st.session_state.venta_actual:
             st.markdown("---")
             st.subheader("Venta Actual")
-            st.dataframe(pd.DataFrame(st.session_state.venta_actual), width="stretch")
+            tabla(pd.DataFrame(st.session_state.venta_actual), dinero=['Precio Unitario', 'Total Venta'])
 
             with st.form("eliminar_item_venta_form"):
                 indices_a_eliminar = st.multiselect("Selecciona productos para eliminar", options=range(len(st.session_state.venta_actual)), format_func=lambda i: f"{st.session_state.venta_actual[i]['Producto']} (Talla: {st.session_state.venta_actual[i]['Talla']})")
@@ -313,7 +398,7 @@ elif opcion == "💰 Registrar Venta":
                 st.markdown("---")
                 st.subheader(f"Paso 3: Finalizar Venta para {cliente_final}")
                 total_venta_actual = pd.DataFrame(st.session_state.venta_actual)["Total Venta"].sum()
-                st.info(f"**Total de la Venta Actual: ${total_venta_actual:,.2f}**")
+                st.metric("Total de la venta", fmt_dinero(total_venta_actual), border=True)
 
                 estado_pago = st.selectbox("Estado del Pago", ["Pagado", "Abono", "Debe"], key="estado_pago_selector")
 
@@ -322,7 +407,7 @@ elif opcion == "💰 Registrar Venta":
                     if estado_pago == "Abono":
                         monto_abono_inicial = st.number_input("Monto del Abono Inicial ($)", min_value=0.01, max_value=max(float(total_venta_actual), 0.01), format="%.2f")
 
-                    if st.form_submit_button("✅ Registrar Venta Completa"):
+                    if st.form_submit_button("✅ Registrar Venta Completa", type="primary"):
                         if estado_pago == "Abono" and monto_abono_inicial <= 0:
                             st.error("Para un 'Abono', el monto debe ser mayor a cero.")
                         else:
@@ -354,15 +439,16 @@ elif opcion == "💰 Registrar Venta":
 
 # --- PESTAÑA DE COMPRAS ---
 elif opcion == "🛒 Registrar Compra":
-    st.header("Formulario de Registro de Compras")
+    st.header("Registrar Compra")
 
-    st.subheader("Paso 1: Elige el Proveedor")
-    col1, col2 = st.columns([2, 2])
-    with col1:
-        lista_proveedores = [""] + proveedores_df['NombreProveedor'].tolist()
-        proveedor_existente = st.selectbox("Selecciona un Proveedor Existente", options=lista_proveedores)
-    with col2:
-        proveedor_nuevo = st.text_input("O añade un Proveedor Nuevo aquí").strip()
+    with st.container(border=True):
+        st.subheader("Paso 1: Elige el Proveedor")
+        col1, col2 = st.columns([2, 2])
+        with col1:
+            lista_proveedores = [""] + proveedores_df['NombreProveedor'].tolist()
+            proveedor_existente = st.selectbox("Selecciona un Proveedor Existente", options=lista_proveedores)
+        with col2:
+            proveedor_nuevo = st.text_input("O añade un Proveedor Nuevo aquí").strip()
 
     proveedor_final = proveedor_nuevo if proveedor_nuevo else proveedor_existente
 
@@ -391,7 +477,8 @@ elif opcion == "🛒 Registrar Compra":
         if st.session_state.compra_actual:
             st.markdown("---")
             st.subheader("Orden de Compra Actual")
-            st.dataframe(pd.DataFrame(st.session_state.compra_actual), width="stretch")
+            tabla(pd.DataFrame(st.session_state.compra_actual), dinero=['Costo Total'])
+            st.metric("Total de la compra", fmt_dinero(sum(item["Costo Total"] for item in st.session_state.compra_actual)), border=True)
 
             with st.form("eliminar_item_compra_form"):
                 indices_a_eliminar = st.multiselect("Selecciona productos para eliminar", options=range(len(st.session_state.compra_actual)), format_func=lambda i: f"{st.session_state.compra_actual[i]['Producto']} (Talla: {st.session_state.compra_actual[i]['Talla']})")
@@ -404,7 +491,7 @@ elif opcion == "🛒 Registrar Compra":
                 st.subheader(f"Paso 3: Finalizar Compra de {proveedor_final}")
                 with st.form("finalizar_compra_form"):
                     costo_envio = st.number_input("Costo Total del Envío ($)", min_value=0.0, format="%.2f")
-                    if st.form_submit_button("✅ Registrar Compra Completa"):
+                    if st.form_submit_button("✅ Registrar Compra Completa", type="primary"):
                         if proveedor_nuevo and proveedor_nuevo not in proveedores_df['NombreProveedor'].tolist():
                             sheets["proveedores"].append_row([proveedor_nuevo])
                             st.success(f"¡Nuevo proveedor '{proveedor_nuevo}' añadido a la base de datos!")
@@ -424,7 +511,7 @@ elif opcion == "🛒 Registrar Compra":
 
 # --- PESTAÑA DE OBSEQUIOS ---
 elif opcion == "🎁 Registrar Obsequio":
-    st.header("Formulario de Registro de Obsequios")
+    st.header("Registrar Obsequio")
     st.warning("Esta acción disminuirá tu inventario y se registrará como un costo (no un ingreso).")
 
     producto_obsequiado = st.selectbox("Producto a Obsequiar", options=list(PRODUCTOS.keys()))
@@ -435,7 +522,7 @@ elif opcion == "🎁 Registrar Obsequio":
         cantidad_obsequiada = c2.number_input("Cantidad", min_value=1, step=1)
         motivo = c3.text_input("Motivo / Cliente")
 
-        if st.form_submit_button("Registrar Obsequio"):
+        if st.form_submit_button("🎁 Registrar Obsequio", type="primary"):
             if producto_obsequiado and motivo:
                 with st.spinner("Registrando obsequio..."):
                     costo_unitario = float(productos_df[productos_df['NombreProducto'] == producto_obsequiado]['CostoCompraDefecto'].iloc[0])
@@ -456,7 +543,7 @@ elif opcion == "🎁 Registrar Obsequio":
 
 # --- PESTAÑA DE CUENTAS POR COBRAR ---
 elif opcion == "🧾 Cuentas por Cobrar":
-    st.header("Gestión de Cuentas por Cobrar")
+    st.header("Cuentas por Cobrar")
 
     ventas_df = get_data("ventas")
     pagos_df = get_data("pagos")
@@ -485,8 +572,12 @@ elif opcion == "🧾 Cuentas por Cobrar":
                 st.success("🎉 ¡Felicidades! No tienes ninguna cuenta por cobrar pendiente.")
                 st.stop()
 
+            d1, d2 = st.columns(2)
+            d1.metric("Total por cobrar", fmt_dinero(resumen_deudas['Saldo Pendiente'].sum()), border=True)
+            d2.metric("Ventas con saldo pendiente", len(resumen_deudas), border=True)
+
             st.subheader("Resumen de Deudas")
-            st.dataframe(resumen_deudas, width="stretch")
+            tabla(resumen_deudas.rename(columns={'Total_Venta': 'Total Venta'}), dinero=['Total Venta', 'Monto Pagado', 'Saldo Pendiente'])
 
             st.markdown("---")
             st.subheader("Registrar Abono o Pago Final")
@@ -494,10 +585,10 @@ elif opcion == "🧾 Cuentas por Cobrar":
                 id_venta_pago = st.selectbox("Selecciona el ID de la Venta", options=resumen_deudas['ID Venta'].unique())
                 monto_pago = st.number_input("Monto del Pago ($)", min_value=0.01, format="%.2f")
 
-                if st.form_submit_button("Registrar Pago"):
+                if st.form_submit_button("Registrar Pago", type="primary"):
                     saldo_actual = resumen_deudas[resumen_deudas['ID Venta'] == id_venta_pago]['Saldo Pendiente'].iloc[0]
                     if monto_pago > saldo_actual + 0.01:
-                        st.error(f"El pago (${monto_pago:,.2f}) supera el saldo pendiente de la venta (${saldo_actual:,.2f}).")
+                        st.error(f"El pago ({fmt_dinero(monto_pago)}) supera el saldo pendiente de la venta ({fmt_dinero(saldo_actual)}).")
                     elif id_venta_pago and monto_pago > 0:
                         with st.spinner("Registrando pago..."):
                             id_pago = f"PAGO-{uuid.uuid4().hex[:8].upper()}"
@@ -514,7 +605,7 @@ elif opcion == "🧾 Cuentas por Cobrar":
                                     sheets["ventas"].update_cell(cell.row, estado_col_index, "Pagado")
                                 avisar(f"¡Pago registrado y Venta {id_venta_pago} marcada como 'Pagado'!")
                             else:
-                                avisar(f"¡Abono de ${monto_pago:,.2f} registrado para la venta {id_venta_pago}!")
+                                avisar(f"¡Abono de {fmt_dinero(monto_pago)} registrado para la venta {id_venta_pago}!")
 
                             st.cache_data.clear()
                             st.rerun()
@@ -595,10 +686,61 @@ elif opcion == "📊 Finanzas":
         st.markdown("---")
         st.subheader(f"Resumen Financiero para: {mes_seleccionado}")
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("💰 Ingresos Reales (Recibido)", f"${total_ingresos_reales:,.2f}")
-        col2.metric("💸 Gastos Totales", f"${total_gastos:,.2f}")
-        col3.metric("📈 Ganancia Real", f"${ganancia_real:,.2f}", delta=f"{ganancia_real:,.2f}")
-        col4.metric("🧾 Cuentas por Cobrar (Total)", f"${total_por_cobrar:,.2f}")
+        col1.metric("💰 Ingresos Reales (Recibido)", fmt_dinero(total_ingresos_reales), border=True)
+        col2.metric("💸 Gastos Totales", fmt_dinero(total_gastos), border=True)
+        col3.metric("📈 Ganancia Real", fmt_dinero(ganancia_real), border=True)
+        col4.metric("🧾 Cuentas por Cobrar (Total)", fmt_dinero(total_por_cobrar), border=True)
+
+        # --- Gráficas ---
+        por_mes = {}
+        def acumular(df, columna, concepto):
+            if 'Mes' in df.columns and columna in df.columns:
+                for mes, valor in df.groupby('Mes')[columna].sum().items():
+                    if mes != 'NaT':
+                        por_mes[(mes, concepto)] = por_mes.get((mes, concepto), 0) + valor
+        acumular(ventas_df_full, 'Total Venta', 'Ventas')
+        acumular(compras_df_full, 'Costo Total', 'Gastos')
+        if not compras_df_full.empty:
+            acumular(compras_df_full.drop_duplicates(subset=['ID Compra']), 'Costo Envio', 'Gastos')
+        acumular(obsequios_df_full, 'Costo Total', 'Gastos')
+        meses_df = pd.DataFrame([{'Mes': m, 'Concepto': c, 'Valor': v} for (m, c), v in sorted(por_mes.items())])
+
+        top_df = pd.DataFrame()
+        if not ventas_filtradas.empty:
+            top_df = (ventas_filtradas.groupby('Producto')['Total Venta'].sum()
+                      .sort_values(ascending=False).head(10).reset_index())
+
+        g1, g2 = st.columns(2)
+        with g1.container(border=True):
+            st.markdown("**Ventas y gastos por mes**")
+            if meses_df.empty:
+                st.caption("Aún no hay movimientos para graficar.")
+            else:
+                st.altair_chart(
+                    alt.Chart(meses_df).mark_bar(cornerRadiusEnd=4).encode(
+                        x=alt.X('Mes:N', title=None, axis=alt.Axis(labelAngle=0)),
+                        xOffset=alt.XOffset('Concepto:N', sort=['Ventas', 'Gastos']),
+                        y=alt.Y('Valor:Q', title=None, axis=alt.Axis(format='~s')),
+                        color=alt.Color('Concepto:N', title=None, sort=['Ventas', 'Gastos'],
+                                        scale=alt.Scale(domain=['Ventas', 'Gastos'], range=[COLOR_VENTAS, COLOR_GASTOS]),
+                                        legend=alt.Legend(orient='top')),
+                        tooltip=[alt.Tooltip('Mes:N'), alt.Tooltip('Concepto:N'), alt.Tooltip('Valor:Q', format=',.0f')],
+                    ).properties(height=300),
+                    width="stretch",
+                )
+        with g2.container(border=True):
+            st.markdown(f"**Productos más vendidos ({mes_seleccionado})**")
+            if top_df.empty:
+                st.caption("No hay ventas en este periodo.")
+            else:
+                st.altair_chart(
+                    alt.Chart(top_df).mark_bar(cornerRadiusEnd=4, color=COLOR_VENTAS).encode(
+                        x=alt.X('Total Venta:Q', title=None, axis=alt.Axis(format='~s')),
+                        y=alt.Y('Producto:N', title=None, sort='-x', axis=alt.Axis(labelLimit=220)),
+                        tooltip=[alt.Tooltip('Producto:N'), alt.Tooltip('Total Venta:Q', format=',.0f')],
+                    ).properties(height=300),
+                    width="stretch",
+                )
 
         st.markdown("---")
         st.subheader("Análisis de Inventario Actual")
@@ -627,8 +769,8 @@ elif opcion == "📊 Finanzas":
             ganancia_potencial = valor_total_venta - valor_total_costo
 
             col_inv1, col_inv2 = st.columns(2)
-            col_inv1.metric("📦 Valor del Inventario (a costo)", f"${valor_total_costo:,.2f}")
-            col_inv2.metric("💵 Ganancia Potencial del Stock", f"${ganancia_potencial:,.2f}")
+            col_inv1.metric("📦 Valor del Inventario (a costo)", fmt_dinero(valor_total_costo), border=True)
+            col_inv2.metric("💵 Ganancia Potencial del Stock", fmt_dinero(ganancia_potencial), border=True)
         else:
             st.info("No hay datos de inventario o productos para realizar el análisis.")
 
@@ -636,17 +778,17 @@ elif opcion == "📊 Finanzas":
         st.subheader(f"Detalle de Movimientos para: {mes_seleccionado}")
 
         exp_ventas = st.expander("Ver detalle de todas las ventas")
-        exp_ventas.dataframe(ventas_filtradas, width="stretch")
+        tabla(ventas_filtradas, dinero=['Precio Unitario', 'Total Venta'], contenedor=exp_ventas)
 
         exp_compras = st.expander("Ver detalle de compras")
-        exp_compras.dataframe(compras_filtradas, width="stretch")
+        tabla(compras_filtradas, dinero=['Costo Total', 'Costo Envio'], contenedor=exp_compras)
 
         exp_obsequios = st.expander("Ver detalle de obsequios (costo)")
-        exp_obsequios.dataframe(obsequios_filtrados, width="stretch")
+        tabla(obsequios_filtrados, dinero=['Costo Total'], contenedor=exp_obsequios)
 
 # --- PESTAÑA DE INVENTARIO ---
 elif opcion == "📈 Ver Inventario":
-    st.header("Vista del Inventario Actual")
+    st.header("Inventario")
     if st.button("🔄 Refrescar Inventario"):
         with st.spinner("Actualizando..."):
             actualizar_inventario()
@@ -654,6 +796,44 @@ elif opcion == "📈 Ver Inventario":
 
     inventario_df = get_data("inventario")
     if not inventario_df.empty:
-        st.dataframe(inventario_df, width="stretch")
+        for col in ['Unidades Compradas', 'Unidades Vendidas', 'Stock Actual']:
+            if col in inventario_df.columns:
+                inventario_df[col] = pd.to_numeric(inventario_df[col], errors='coerce').fillna(0)
+        inventario_df['Estado'] = inventario_df['Stock Actual'].apply(estado_stock)
+        stock = inventario_df['Stock Actual']
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Referencias", len(inventario_df), border=True)
+        m2.metric("Unidades en stock", f"{int(stock.clip(lower=0).sum()):,}".replace(",", "."), border=True)
+        m3.metric("🟡 Stock bajo", int(((stock > 0) & (stock <= STOCK_BAJO)).sum()), border=True)
+        m4.metric("🔴 Agotados", int((stock <= 0).sum()), border=True)
+
+        f1, f2, f3 = st.columns([3, 2, 2])
+        busqueda = f1.text_input("Buscar producto", placeholder="Escribe parte del nombre...")
+        categorias = f2.multiselect("Categoría / Talla", options=sorted(inventario_df['Talla'].astype(str).unique()))
+        estados = f3.multiselect("Estado", options=["🟢 Disponible", "🟡 Bajo", "🔴 Agotado"])
+
+        vista = inventario_df
+        if busqueda.strip():
+            vista = vista[vista['Producto'].astype(str).str.contains(busqueda.strip(), case=False, regex=False)]
+        if categorias:
+            vista = vista[vista['Talla'].astype(str).isin(categorias)]
+        if estados:
+            vista = vista[vista['Estado'].isin(estados)]
+
+        columnas = [c for c in ['Producto', 'Talla', 'Estado', 'Stock Actual', 'Unidades Compradas', 'Unidades Vendidas', 'Fecha Actualizacion'] if c in vista.columns]
+        st.dataframe(
+            vista[columnas].sort_values('Producto'),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                'Talla': st.column_config.TextColumn("Categoría / Talla"),
+                'Stock Actual': st.column_config.NumberColumn("Stock", format="%d"),
+                'Unidades Compradas': st.column_config.NumberColumn("Compradas", format="%d"),
+                'Unidades Vendidas': st.column_config.NumberColumn("Vendidas", format="%d"),
+                'Fecha Actualizacion': st.column_config.TextColumn("Actualizado"),
+            },
+        )
+        st.caption(f"Mostrando {len(vista)} de {len(inventario_df)} referencias.")
     else:
         st.info("No hay datos de inventario. Registra compras para empezar.")
