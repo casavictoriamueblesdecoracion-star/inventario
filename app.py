@@ -39,14 +39,10 @@ ZONA_HORARIA = "America/Bogota"
 # Un producto se marca con "stock bajo" cuando le quedan estas unidades o menos.
 STOCK_BAJO = 3
 
-# Secciones del menú que solo puede ver el administrador (requieren clave).
-# El resto queda disponible para cualquier usuario.
-SECCIONES_ADMIN = ["📊 Finanzas", "⚙️ Gestión"]
-
-# Clave del administrador, guardada como huella SHA-256 (no en texto) porque
-# este archivo vive en GitHub. Para cambiarla sin tocar el código, agrega en
-# los Secrets de Streamlit Cloud una línea:  clave_admin = "tu_nueva_clave"
-CLAVE_ADMIN_HASH = "b9af0038d4b32a24482078819f5f9ba74533d9a4e1416655ed17cc52f2a1d268"
+# Clave que se pide al abrir la app, guardada como huella SHA-256 (no en texto)
+# porque este archivo vive en GitHub. Para cambiarla sin tocar el código, agrega
+# en los Secrets de Streamlit Cloud una línea:  clave_acceso = "tu_nueva_clave"
+CLAVE_HASH ="b9af0038d4b32a24482078819f5f9ba74533d9a4e1416655ed17cc52f2a1d268"
 
 # =============================================================================
 # A PARTIR DE AQUÍ NO NECESITAS MODIFICAR NADA (a menos que quieras adaptar
@@ -67,12 +63,42 @@ st.set_page_config(
     layout="wide"
 )
 
+# Recorta el logo en círculo para que no se vea su fondo cuadrado.
+st.markdown('<style>[data-testid="stImage"] img {border-radius: 50%;}</style>', unsafe_allow_html=True)
+
+# --- ACCESO CON CLAVE ---
+# Nada de la app (ni los datos de Google Sheets) se carga hasta ingresar la clave.
+def clave_correcta(clave):
+    """Valida la clave contra Secrets o, si no hay, contra CLAVE_HASH."""
+    try:
+        clave_secreta = st.secrets.get("clave_acceso")
+    except Exception:
+        clave_secreta = None
+    if clave_secreta:
+        return hmac.compare_digest(clave.encode(), str(clave_secreta).encode())
+    return hmac.compare_digest(hashlib.sha256(clave.encode()).hexdigest(), CLAVE_HASH)
+
+if not st.session_state.get('autenticado', False):
+    _, centro, _ = st.columns([1, 1.2, 1])
+    with centro:
+        if LOGO:
+            _, col_logo, _ = st.columns([1, 2, 1])
+            col_logo.image(LOGO, width="stretch")
+        st.title(NOMBRE_APP)
+        with st.form("acceso_form"):
+            clave_ingresada = st.text_input("Clave de acceso", type="password")
+            if st.form_submit_button("Entrar", type="primary", width="stretch"):
+                if clave_correcta(clave_ingresada):
+                    st.session_state.autenticado = True
+                    st.rerun()
+                else:
+                    st.error("Clave incorrecta.")
+    st.stop()
+
 # --- LOGO EN LA BARRA LATERAL ---
 if LOGO:
     _, col_logo, _ = st.sidebar.columns([1, 4, 1])
     col_logo.image(LOGO, width="stretch")
-    # Recorta el logo en círculo para que no se vea su fondo sobre la barra oscura.
-    st.markdown('<style>[data-testid="stSidebar"] [data-testid="stImage"] img {border-radius: 50%;}</style>', unsafe_allow_html=True)
 st.sidebar.subheader("Menú")
 
 
@@ -147,16 +173,6 @@ def ahora():
 def avisar(mensaje):
     """Guarda un mensaje de éxito para mostrarlo después de recargar la página."""
     st.session_state.aviso = mensaje
-
-def clave_admin_correcta(clave):
-    """Valida la clave del administrador contra Secrets o, si no hay, contra CLAVE_ADMIN_HASH."""
-    try:
-        clave_secreta = st.secrets.get("clave_admin")
-    except Exception:
-        clave_secreta = None
-    if clave_secreta:
-        return hmac.compare_digest(clave.encode(), str(clave_secreta).encode())
-    return hmac.compare_digest(hashlib.sha256(clave.encode()).hexdigest(), CLAVE_ADMIN_HASH)
 
 def fmt_dinero(valor):
     """Formatea un valor como pesos: $ 64.000"""
@@ -250,8 +266,6 @@ if 'compra_actual' not in st.session_state:
     st.session_state.compra_actual = []
 if 'venta_actual' not in st.session_state:
     st.session_state.venta_actual = []
-if 'es_admin' not in st.session_state:
-    st.session_state.es_admin = False
 
 # --- INTERFAZ DE LA APLICACIÓN ---
 st.title(NOMBRE_APP)
@@ -260,34 +274,15 @@ if 'aviso' in st.session_state:
     st.success(st.session_state.pop('aviso'))
     st.balloons()
 
-secciones = ["📈 Ver Inventario", "💰 Registrar Venta", "🛒 Registrar Compra", "🎁 Registrar Obsequio", "📊 Finanzas", "🧾 Cuentas por Cobrar", "⚙️ Gestión"]
-if not st.session_state.es_admin:
-    secciones = [s for s in secciones if s not in SECCIONES_ADMIN]
+opcion = st.sidebar.radio(
+    "Selecciona una opción:",
+    ["📈 Ver Inventario", "💰 Registrar Venta", "🛒 Registrar Compra", "🎁 Registrar Obsequio", "📊 Finanzas", "🧾 Cuentas por Cobrar", "⚙️ Gestión"]
+)
 
-opcion = st.sidebar.radio("Selecciona una opción:", secciones)
-
-# --- ACCESO DE ADMINISTRADOR ---
 st.sidebar.markdown("---")
-if st.session_state.es_admin:
-    st.sidebar.success("👑 Administrador")
-    if st.sidebar.button("Cerrar sesión"):
-        st.session_state.es_admin = False
-        st.rerun()
-else:
-    st.sidebar.caption("👤 Usuario")
-    with st.sidebar.expander("🔐 Acceso administrador"):
-        with st.form("acceso_admin_form", clear_on_submit=True):
-            clave_ingresada = st.text_input("Clave", type="password")
-            if st.form_submit_button("Entrar", type="primary"):
-                if clave_admin_correcta(clave_ingresada):
-                    st.session_state.es_admin = True
-                    st.rerun()
-                else:
-                    st.error("Clave incorrecta.")
-
-if opcion in SECCIONES_ADMIN and not st.session_state.es_admin:
-    st.error("Esta sección es solo para el administrador.")
-    st.stop()
+if st.sidebar.button("🔒 Cerrar sesión"):
+    st.session_state.autenticado = False
+    st.rerun()
 
 # --- PESTAÑA DE GESTIÓN ---
 if opcion == "⚙️ Gestión":
