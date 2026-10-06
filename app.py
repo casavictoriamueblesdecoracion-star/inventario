@@ -3,6 +3,7 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import uuid
 
 # =============================================================================
@@ -27,6 +28,10 @@ NOMBRE_HOJA_CALCULO = "BaseDeDatos_Negocio"
 #   https://raw.githubusercontent.com/TU_USUARIO/TU_REPO/main/assets/logo.jpeg
 LOGO_URL = ""
 
+# Zona horaria de tu negocio. Se usa para la fecha y hora de cada registro
+# (el servidor de Streamlit Cloud trabaja en hora UTC).
+ZONA_HORARIA = "America/Bogota"
+
 # =============================================================================
 # A PARTIR DE AQUÍ NO NECESITAS MODIFICAR NADA (a menos que quieras adaptar
 # la lógica del negocio, agregar campos, etc.)
@@ -40,7 +45,7 @@ st.set_page_config(
 
 # --- LOGO EN LA BARRA LATERAL ---
 if LOGO_URL:
-    st.sidebar.image(LOGO_URL, use_container_width=True)
+    st.sidebar.image(LOGO_URL, width="stretch")
 st.sidebar.title("Menú de Navegación")
 
 
@@ -90,8 +95,15 @@ def load_master_data():
     clientes_df = pd.DataFrame(sheets["clientes"].get_all_records())
     proveedores_df = pd.DataFrame(sheets["proveedores"].get_all_records())
 
+    # Si una hoja solo tiene el encabezado, se garantiza que la columna exista.
+    if 'NombreCliente' not in clientes_df.columns:
+        clientes_df = pd.DataFrame(columns=['NombreCliente'])
+    if 'NombreProveedor' not in proveedores_df.columns:
+        proveedores_df = pd.DataFrame(columns=['NombreProveedor'])
+
     productos_dict = {}
     if not productos_df.empty:
+        productos_df['NombreProducto'] = productos_df['NombreProducto'].astype(str).str.strip()
         for _, row in productos_df.iterrows():
             tallas = [t.strip() for t in str(row['TallasDisponibles']).split(',')]
             productos_dict[row['NombreProducto']] = tallas
@@ -101,6 +113,20 @@ def load_master_data():
 productos_df, PRODUCTOS, clientes_df, proveedores_df = load_master_data()
 
 # --- FUNCIONES AUXILIARES ---
+def ahora():
+    """Fecha y hora actual en la zona horaria del negocio."""
+    return datetime.now(ZoneInfo(ZONA_HORARIA)).strftime("%Y-%m-%d %H:%M:%S")
+
+def avisar(mensaje):
+    """Guarda un mensaje de éxito para mostrarlo después de recargar la página."""
+    st.session_state.aviso = mensaje
+
+def suma(df, columna):
+    """Suma una columna numérica; devuelve 0 si la columna no existe."""
+    if columna not in df.columns:
+        return 0
+    return pd.to_numeric(df[columna], errors='coerce').fillna(0).sum()
+
 def get_data(sheet_name):
     """Obtiene datos de una hoja y los devuelve como DataFrame."""
     records = sheets[sheet_name].get_all_records()
@@ -147,9 +173,12 @@ def actualizar_inventario():
     inventario_df['Unidades Compradas'] = pd.to_numeric(inventario_df['Unidades Compradas'], errors='coerce').fillna(0)
     inventario_df['Unidades Salientes'] = pd.to_numeric(inventario_df['Unidades Salientes'], errors='coerce').fillna(0)
 
-    inventario_df[['Producto', 'Talla']] = inventario_df['SKU'].str.split(' - ', expand=True)
+    # Se separa por el último " - " para tolerar nombres de producto que lo contengan.
+    partes_sku = inventario_df['SKU'].astype(str).str.rsplit(' - ', n=1)
+    inventario_df['Producto'] = partes_sku.str[0]
+    inventario_df['Talla'] = partes_sku.str[1]
     inventario_df['Stock Actual'] = inventario_df['Unidades Compradas'] - inventario_df['Unidades Salientes']
-    inventario_df['Fecha Actualizacion'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    inventario_df['Fecha Actualizacion'] = ahora()
 
     column_order = ["SKU", "Producto", "Talla", "Unidades Compradas", "Unidades Salientes", "Stock Actual", "Fecha Actualizacion"]
     inventario_df = inventario_df.rename(columns={'Unidades Salientes': 'Unidades Vendidas'})
@@ -166,6 +195,10 @@ if 'venta_actual' not in st.session_state:
 
 # --- INTERFAZ DE LA APLICACIÓN ---
 st.title(f"{ICONO_APP} {NOMBRE_APP}")
+
+if 'aviso' in st.session_state:
+    st.success(st.session_state.pop('aviso'))
+    st.balloons()
 
 opcion = st.sidebar.radio(
     "Selecciona una opción:",
@@ -186,45 +219,48 @@ if opcion == "⚙️ Gestión":
             precio = st.number_input("Precio de Venta por Defecto", min_value=0.0, format="%.2f")
             costo = st.number_input("Costo de Compra por Defecto", min_value=0.0, format="%.2f")
             if st.form_submit_button("Añadir Producto"):
+                nombre, tallas = nombre.strip(), tallas.strip()
                 if nombre and tallas:
                     sheets["productos"].append_row([nombre, tallas, precio, costo])
-                    st.success(f"¡Producto '{nombre}' añadido!")
+                    avisar(f"¡Producto '{nombre}' añadido!")
                     st.cache_data.clear()
                     st.rerun()
                 else:
                     st.warning("Nombre y Tallas son campos obligatorios.")
         st.subheader("Lista de Productos Actual")
-        st.dataframe(productos_df, use_container_width=True)
+        st.dataframe(productos_df, width="stretch")
 
     with tab2:
         st.subheader("Añadir Nuevo Cliente")
         with st.form("nuevo_cliente_form", clear_on_submit=True):
             nombre = st.text_input("Nombre del Nuevo Cliente")
             if st.form_submit_button("Añadir Cliente"):
+                nombre = nombre.strip()
                 if nombre:
                     sheets["clientes"].append_row([nombre])
-                    st.success(f"¡Cliente '{nombre}' añadido!")
+                    avisar(f"¡Cliente '{nombre}' añadido!")
                     st.cache_data.clear()
                     st.rerun()
                 else:
                     st.warning("El nombre del cliente no puede estar vacío.")
         st.subheader("Lista de Clientes Actual")
-        st.dataframe(clientes_df, use_container_width=True)
+        st.dataframe(clientes_df, width="stretch")
 
     with tab3:
         st.subheader("Añadir Nuevo Proveedor")
         with st.form("nuevo_proveedor_form", clear_on_submit=True):
             nombre = st.text_input("Nombre del Nuevo Proveedor")
             if st.form_submit_button("Añadir Proveedor"):
+                nombre = nombre.strip()
                 if nombre:
                     sheets["proveedores"].append_row([nombre])
-                    st.success(f"¡Proveedor '{nombre}' añadido!")
+                    avisar(f"¡Proveedor '{nombre}' añadido!")
                     st.cache_data.clear()
                     st.rerun()
                 else:
                     st.warning("El nombre del proveedor no puede estar vacío.")
         st.subheader("Lista de Proveedores Actual")
-        st.dataframe(proveedores_df, use_container_width=True)
+        st.dataframe(proveedores_df, width="stretch")
 
 # --- PESTAÑA DE VENTAS ---
 elif opcion == "💰 Registrar Venta":
@@ -236,9 +272,9 @@ elif opcion == "💰 Registrar Venta":
         lista_clientes = [""] + clientes_df['NombreCliente'].tolist()
         cliente_existente = st.selectbox("Selecciona un Cliente Existente", options=lista_clientes, help="Elige un cliente de tu lista.")
     with col2:
-        cliente_nuevo = st.text_input("O añade un Cliente Nuevo aquí", help="Si el cliente no existe, escríbelo aquí.")
+        cliente_nuevo = st.text_input("O añade un Cliente Nuevo aquí", help="Si el cliente no existe, escríbelo aquí.").strip()
 
-    cliente_final = cliente_nuevo.strip() if cliente_nuevo else cliente_existente
+    cliente_final = cliente_nuevo if cliente_nuevo else cliente_existente
 
     if cliente_final:
         st.success(f"Cliente seleccionado: **{cliente_final}**")
@@ -265,7 +301,7 @@ elif opcion == "💰 Registrar Venta":
         if st.session_state.venta_actual:
             st.markdown("---")
             st.subheader("Venta Actual")
-            st.dataframe(pd.DataFrame(st.session_state.venta_actual), use_container_width=True)
+            st.dataframe(pd.DataFrame(st.session_state.venta_actual), width="stretch")
 
             with st.form("eliminar_item_venta_form"):
                 indices_a_eliminar = st.multiselect("Selecciona productos para eliminar", options=range(len(st.session_state.venta_actual)), format_func=lambda i: f"{st.session_state.venta_actual[i]['Producto']} (Talla: {st.session_state.venta_actual[i]['Talla']})")
@@ -284,7 +320,7 @@ elif opcion == "💰 Registrar Venta":
                 with st.form("finalizar_venta_form"):
                     monto_abono_inicial = 0
                     if estado_pago == "Abono":
-                        monto_abono_inicial = st.number_input("Monto del Abono Inicial ($)", min_value=0.01, max_value=total_venta_actual, format="%.2f")
+                        monto_abono_inicial = st.number_input("Monto del Abono Inicial ($)", min_value=0.01, max_value=max(float(total_venta_actual), 0.01), format="%.2f")
 
                     if st.form_submit_button("✅ Registrar Venta Completa"):
                         if estado_pago == "Abono" and monto_abono_inicial <= 0:
@@ -297,7 +333,7 @@ elif opcion == "💰 Registrar Venta":
 
                             with st.spinner("Registrando venta y pago inicial..."):
                                 id_venta = f"VENTA-{uuid.uuid4().hex[:8].upper()}"
-                                fecha_venta = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                fecha_venta = ahora()
 
                                 if estado_pago == "Pagado":
                                     id_pago = f"PAGO-{uuid.uuid4().hex[:8].upper()}"
@@ -309,8 +345,7 @@ elif opcion == "💰 Registrar Venta":
                                 filas_venta = [[id_venta, fecha_venta, item["Producto"], item["Talla"], cliente_final, item["Cantidad"], item["Precio Unitario"], item["Total Venta"], estado_pago] for item in st.session_state.venta_actual]
                                 sheets["ventas"].append_rows(filas_venta)
 
-                                st.success(f"¡Venta {id_venta} registrada!")
-                                st.balloons()
+                                avisar(f"¡Venta {id_venta} registrada!")
                                 st.session_state.venta_actual = []
                                 actualizar_inventario()
                                 st.rerun()
@@ -327,9 +362,9 @@ elif opcion == "🛒 Registrar Compra":
         lista_proveedores = [""] + proveedores_df['NombreProveedor'].tolist()
         proveedor_existente = st.selectbox("Selecciona un Proveedor Existente", options=lista_proveedores)
     with col2:
-        proveedor_nuevo = st.text_input("O añade un Proveedor Nuevo aquí")
+        proveedor_nuevo = st.text_input("O añade un Proveedor Nuevo aquí").strip()
 
-    proveedor_final = proveedor_nuevo.strip() if proveedor_nuevo else proveedor_existente
+    proveedor_final = proveedor_nuevo if proveedor_nuevo else proveedor_existente
 
     if proveedor_final:
         st.success(f"Proveedor seleccionado: **{proveedor_final}**")
@@ -356,7 +391,7 @@ elif opcion == "🛒 Registrar Compra":
         if st.session_state.compra_actual:
             st.markdown("---")
             st.subheader("Orden de Compra Actual")
-            st.dataframe(pd.DataFrame(st.session_state.compra_actual), use_container_width=True)
+            st.dataframe(pd.DataFrame(st.session_state.compra_actual), width="stretch")
 
             with st.form("eliminar_item_compra_form"):
                 indices_a_eliminar = st.multiselect("Selecciona productos para eliminar", options=range(len(st.session_state.compra_actual)), format_func=lambda i: f"{st.session_state.compra_actual[i]['Producto']} (Talla: {st.session_state.compra_actual[i]['Talla']})")
@@ -377,11 +412,10 @@ elif opcion == "🛒 Registrar Compra":
 
                         with st.spinner("Registrando compra..."):
                             id_compra = f"COMPRA-{uuid.uuid4().hex[:8].upper()}"
-                            fecha_compra = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            fecha_compra = ahora()
                             filas_para_añadir = [[id_compra, fecha_compra, item["Producto"], item["Talla"], proveedor_final, item["Cantidad"], item["Costo Total"], costo_envio] for item in st.session_state.compra_actual]
                             sheets["compras"].append_rows(filas_para_añadir)
-                            st.success(f"¡Compra {id_compra} registrada!")
-                            st.balloons()
+                            avisar(f"¡Compra {id_compra} registrada!")
                             st.session_state.compra_actual = []
                             actualizar_inventario()
                             st.rerun()
@@ -393,9 +427,9 @@ elif opcion == "🎁 Registrar Obsequio":
     st.header("Formulario de Registro de Obsequios")
     st.warning("Esta acción disminuirá tu inventario y se registrará como un costo (no un ingreso).")
 
-    with st.form("obsequio_form", clear_on_submit=True):
-        producto_obsequiado = st.selectbox("Producto a Obsequiar", options=list(PRODUCTOS.keys()))
+    producto_obsequiado = st.selectbox("Producto a Obsequiar", options=list(PRODUCTOS.keys()))
 
+    with st.form("obsequio_form", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         talla_obsequiada = c1.selectbox("Talla", options=PRODUCTOS.get(producto_obsequiado, []))
         cantidad_obsequiada = c2.number_input("Cantidad", min_value=1, step=1)
@@ -408,7 +442,7 @@ elif opcion == "🎁 Registrar Obsequio":
                     costo_total_obsequio = costo_unitario * cantidad_obsequiada
 
                     id_obsequio = f"OBSEQUIO-{uuid.uuid4().hex[:8].upper()}"
-                    fecha_obsequio = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    fecha_obsequio = ahora()
 
                     fila = [id_obsequio, fecha_obsequio, producto_obsequiado, talla_obsequiada, cantidad_obsequiada, motivo, costo_total_obsequio]
                     sheets["obsequios"].append_row(fila)
@@ -446,8 +480,13 @@ elif opcion == "🧾 Cuentas por Cobrar":
             resumen_deudas = pd.merge(total_venta, total_pagado_por_venta, on='ID Venta', how='left').fillna(0)
             resumen_deudas['Saldo Pendiente'] = resumen_deudas['Total_Venta'] - resumen_deudas['Monto Pagado']
 
+            resumen_deudas = resumen_deudas[resumen_deudas['Saldo Pendiente'] > 0.01]
+            if resumen_deudas.empty:
+                st.success("🎉 ¡Felicidades! No tienes ninguna cuenta por cobrar pendiente.")
+                st.stop()
+
             st.subheader("Resumen de Deudas")
-            st.dataframe(resumen_deudas[resumen_deudas['Saldo Pendiente'] > 0.01], use_container_width=True)
+            st.dataframe(resumen_deudas, width="stretch")
 
             st.markdown("---")
             st.subheader("Registrar Abono o Pago Final")
@@ -456,10 +495,13 @@ elif opcion == "🧾 Cuentas por Cobrar":
                 monto_pago = st.number_input("Monto del Pago ($)", min_value=0.01, format="%.2f")
 
                 if st.form_submit_button("Registrar Pago"):
-                    if id_venta_pago and monto_pago > 0:
+                    saldo_actual = resumen_deudas[resumen_deudas['ID Venta'] == id_venta_pago]['Saldo Pendiente'].iloc[0]
+                    if monto_pago > saldo_actual + 0.01:
+                        st.error(f"El pago (${monto_pago:,.2f}) supera el saldo pendiente de la venta (${saldo_actual:,.2f}).")
+                    elif id_venta_pago and monto_pago > 0:
                         with st.spinner("Registrando pago..."):
                             id_pago = f"PAGO-{uuid.uuid4().hex[:8].upper()}"
-                            fecha_pago = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            fecha_pago = ahora()
                             sheets["pagos"].append_row([id_pago, id_venta_pago, fecha_pago, monto_pago])
 
                             venta_info = resumen_deudas[resumen_deudas['ID Venta'] == id_venta_pago].iloc[0]
@@ -470,11 +512,10 @@ elif opcion == "🧾 Cuentas por Cobrar":
                                 estado_col_index = sheets["ventas"].row_values(1).index('Estado Pago') + 1
                                 for cell in cell_list:
                                     sheets["ventas"].update_cell(cell.row, estado_col_index, "Pagado")
-                                st.success(f"¡Pago registrado y Venta {id_venta_pago} marcada como 'Pagado'!")
+                                avisar(f"¡Pago registrado y Venta {id_venta_pago} marcada como 'Pagado'!")
                             else:
-                                st.success(f"¡Abono de ${monto_pago:,.2f} registrado para la venta {id_venta_pago}!")
+                                avisar(f"¡Abono de ${monto_pago:,.2f} registrado para la venta {id_venta_pago}!")
 
-                            st.balloons()
                             st.cache_data.clear()
                             st.rerun()
         else:
@@ -512,25 +553,26 @@ elif opcion == "📊 Finanzas":
             obsequios_df_full['Mes'] = obsequios_df_full['Fecha'].dt.to_period('M').astype(str)
             obsequios_df_full['Costo Total'] = pd.to_numeric(obsequios_df_full['Costo Total'], errors='coerce').fillna(0)
 
-        meses_disponibles = sorted(pd.concat([ventas_df_full.get('Mes'), compras_df_full.get('Mes')]).dropna().unique(), reverse=True)
+        meses = pd.concat([df['Mes'] for df in (ventas_df_full, compras_df_full) if 'Mes' in df.columns])
+        meses_disponibles = sorted((m for m in meses.dropna().unique() if m != 'NaT'), reverse=True)
         if not meses_disponibles:
              st.warning("No hay datos con fechas válidas para generar el reporte.")
              st.stop()
 
         mes_seleccionado = st.selectbox("Selecciona un Mes para Analizar", options=["Todos"] + meses_disponibles)
 
-        if mes_seleccionado != "Todos":
-            ventas_filtradas = ventas_df_full[ventas_df_full['Mes'] == mes_seleccionado] if not ventas_df_full.empty else pd.DataFrame()
-            compras_filtradas = compras_df_full[compras_df_full['Mes'] == mes_seleccionado] if not compras_df_full.empty else pd.DataFrame()
-            pagos_filtrados = pagos_df_full[pagos_df_full['Mes'] == mes_seleccionado] if not pagos_df_full.empty else pd.DataFrame()
-            obsequios_filtrados = obsequios_df_full[obsequios_df_full['Mes'] == mes_seleccionado] if not obsequios_df_full.empty else pd.DataFrame()
-        else:
-            ventas_filtradas = ventas_df_full
-            compras_filtradas = compras_df_full
-            pagos_filtrados = pagos_df_full
-            obsequios_filtrados = obsequios_df_full
+        def filtrar_mes(df):
+            # Una hoja vacía no tiene columna 'Mes': se devuelve tal cual (conserva sus encabezados).
+            if mes_seleccionado == "Todos" or 'Mes' not in df.columns:
+                return df
+            return df[df['Mes'] == mes_seleccionado]
 
-        ingresos_de_pagos = pagos_filtrados['Monto Pagado'].sum()
+        ventas_filtradas = filtrar_mes(ventas_df_full)
+        compras_filtradas = filtrar_mes(compras_df_full)
+        pagos_filtrados = filtrar_mes(pagos_df_full)
+        obsequios_filtrados = filtrar_mes(obsequios_df_full)
+
+        ingresos_de_pagos = suma(pagos_filtrados, 'Monto Pagado')
         ingresos_legacy = 0
         ventas_pagadas_periodo = ventas_filtradas[ventas_filtradas['Estado Pago'] == 'Pagado']
         if not ventas_pagadas_periodo.empty:
@@ -539,15 +581,15 @@ elif opcion == "📊 Finanzas":
             ingresos_legacy = ventas_legacy_pagadas.groupby('ID Venta')['Total Venta'].sum().sum()
         total_ingresos_reales = ingresos_de_pagos + ingresos_legacy
 
-        total_costo_producto = compras_filtradas['Costo Total'].sum()
+        total_costo_producto = suma(compras_filtradas, 'Costo Total')
         total_costo_envio = compras_filtradas.drop_duplicates(subset=['ID Compra'])['Costo Envio'].sum() if not compras_filtradas.empty else 0
-        total_costo_obsequios = obsequios_filtrados['Costo Total'].sum()
+        total_costo_obsequios = suma(obsequios_filtrados, 'Costo Total')
         total_gastos = total_costo_producto + total_costo_envio + total_costo_obsequios
 
         ganancia_real = total_ingresos_reales - total_gastos
 
-        total_ventas_brutas = get_data("ventas")['Total Venta'].sum()
-        total_pagado_historico = get_data("pagos")['Monto Pagado'].sum()
+        total_ventas_brutas = suma(ventas_df_full, 'Total Venta')
+        total_pagado_historico = suma(pagos_df_full, 'Monto Pagado')
         total_por_cobrar = total_ventas_brutas - total_pagado_historico
 
         st.markdown("---")
@@ -594,13 +636,13 @@ elif opcion == "📊 Finanzas":
         st.subheader(f"Detalle de Movimientos para: {mes_seleccionado}")
 
         exp_ventas = st.expander("Ver detalle de todas las ventas")
-        exp_ventas.dataframe(ventas_filtradas, use_container_width=True)
+        exp_ventas.dataframe(ventas_filtradas, width="stretch")
 
         exp_compras = st.expander("Ver detalle de compras")
-        exp_compras.dataframe(compras_filtradas, use_container_width=True)
+        exp_compras.dataframe(compras_filtradas, width="stretch")
 
         exp_obsequios = st.expander("Ver detalle de obsequios (costo)")
-        exp_obsequios.dataframe(obsequios_filtrados, use_container_width=True)
+        exp_obsequios.dataframe(obsequios_filtrados, width="stretch")
 
 # --- PESTAÑA DE INVENTARIO ---
 elif opcion == "📈 Ver Inventario":
@@ -612,6 +654,6 @@ elif opcion == "📈 Ver Inventario":
 
     inventario_df = get_data("inventario")
     if not inventario_df.empty:
-        st.dataframe(inventario_df, use_container_width=True)
+        st.dataframe(inventario_df, width="stretch")
     else:
         st.info("No hay datos de inventario. Registra compras para empezar.")
