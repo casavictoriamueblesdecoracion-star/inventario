@@ -1,5 +1,5 @@
 streamlit>=1.52
 pandas
-gspread
+gspread>=6.0
 google-auth
 tzdata

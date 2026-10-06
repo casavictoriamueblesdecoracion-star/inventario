@@ -36,7 +36,16 @@ LOGO_URL = ""
 # (el servidor de Streamlit Cloud trabaja en hora UTC).
 ZONA_HORARIA = "America/Bogota"
 
-# Un producto se marca con "stock bajo" cuando le quedan estas unidades o menos.
+# Unidades de medida en las que vendes. Cada producto lleva la suya en la columna
+# "Unidad" de la pestaña Productos; si esa celda está vacía se asume la primera.
+UNIDADES = ["Unidad", "Metro", "Lámina"]
+
+# Unidades que admiten cantidades con decimales (por ejemplo 2,5 metros).
+# Las demás solo aceptan cantidades enteras.
+UNIDADES_CON_DECIMALES = ["Metro"]
+
+# Un producto se marca con "stock bajo" cuando le queda esta cantidad o menos.
+# Para un mínimo distinto por producto, agrega la columna "StockMinimo" en Productos.
 STOCK_BAJO = 3
 
 # Clave que se pide al abrir la app, guardada como huella SHA-256 (no en texto)
@@ -140,13 +149,18 @@ def connect_to_gsheets():
 
 sheets = connect_to_gsheets()
 
+def leer_registros(sheet_name):
+    """Lee una hoja con los valores sin formato, para que los números (incluidos
+    los decimales) lleguen como número sin importar la configuración regional."""
+    return sheets[sheet_name].get_all_records(value_render_option="UNFORMATTED_VALUE")
+
 # --- CARGA DE DATOS MAESTROS ---
 @st.cache_data(ttl=300)
 def load_master_data():
     """Carga los datos de las hojas de gestión y los procesa."""
-    productos_df = pd.DataFrame(sheets["productos"].get_all_records())
-    clientes_df = pd.DataFrame(sheets["clientes"].get_all_records())
-    proveedores_df = pd.DataFrame(sheets["proveedores"].get_all_records())
+    productos_df = pd.DataFrame(leer_registros("productos"))
+    clientes_df = pd.DataFrame(leer_registros("clientes"))
+    proveedores_df = pd.DataFrame(leer_registros("proveedores"))
 
     # Si una hoja solo tiene el encabezado, se garantiza que la columna exista.
     if 'NombreCliente' not in clientes_df.columns:
@@ -154,16 +168,25 @@ def load_master_data():
     if 'NombreProveedor' not in proveedores_df.columns:
         proveedores_df = pd.DataFrame(columns=['NombreProveedor'])
 
-    productos_dict = {}
+    productos_dict, unidades_dict, minimos_dict = {}, {}, {}
     if not productos_df.empty:
         productos_df['NombreProducto'] = productos_df['NombreProducto'].astype(str).str.strip()
+        if 'StockMinimo' in productos_df.columns:
+            productos_df['StockMinimo'] = pd.to_numeric(productos_df['StockMinimo'], errors='coerce')
         for _, row in productos_df.iterrows():
             tallas = [t.strip() for t in str(row['TallasDisponibles']).split(',')]
             productos_dict[row['NombreProducto']] = tallas
+            # Columnas opcionales: Unidad y StockMinimo.
+            unidad = str(row.get('Unidad', '')).strip()
+            if unidad:
+                unidades_dict[row['NombreProducto']] = unidad
+            minimo = pd.to_numeric(row.get('StockMinimo', ''), errors='coerce')
+            if pd.notna(minimo):
+                minimos_dict[row['NombreProducto']] = float(minimo)
 
-    return productos_df, productos_dict, clientes_df, proveedores_df
+    return productos_df, productos_dict, clientes_df, proveedores_df, unidades_dict, minimos_dict
 
-productos_df, PRODUCTOS, clientes_df, proveedores_df = load_master_data()
+productos_df, PRODUCTOS, clientes_df, proveedores_df, UNIDAD_PRODUCTO, MINIMO_PRODUCTO = load_master_data()
 
 # --- FUNCIONES AUXILIARES ---
 def ahora():
@@ -181,17 +204,44 @@ def fmt_dinero(valor):
     except (TypeError, ValueError):
         return valor
 
-def tabla(df, dinero=(), contenedor=st):
-    """Muestra una tabla sin índice y con las columnas de dinero formateadas."""
-    columnas = [c for c in dinero if c in df.columns]
-    datos = df.style.format({c: fmt_dinero for c in columnas}) if columnas and not df.empty else df
+def tabla(df, dinero=(), cantidad=('Cantidad',), contenedor=st):
+    """Muestra una tabla sin índice, con dinero y cantidades formateados.
+    La columna interna 'Talla' se muestra como 'Categoría'."""
+    df = df.rename(columns={'Talla': 'Categoría', 'TallasDisponibles': 'Categoría'})
+    formatos = {c: fmt_dinero for c in dinero if c in df.columns}
+    formatos.update({c: fmt_cantidad for c in cantidad if c in df.columns})
+    datos = df.style.format(formatos) if formatos and not df.empty else df
     contenedor.dataframe(datos, width="stretch", hide_index=True)
 
-def estado_stock(unidades):
+def unidad_de(producto):
+    """Unidad de medida del producto (Metro, Lámina, Unidad...)."""
+    return UNIDAD_PRODUCTO.get(producto, UNIDADES[0])
+
+def plural(unidad):
+    """metro -> metros, lámina -> láminas, unidad -> unidades."""
+    unidad = unidad.lower()
+    return unidad + ("s" if unidad[-1:] in "aeiouáéíóú" else "es")
+
+def fmt_cantidad(valor):
+    """Muestra una cantidad sin ceros de más: 4 -> 4, 2.5 -> 2,5"""
+    try:
+        return f"{float(valor):.2f}".rstrip("0").rstrip(".").replace(".", ",")
+    except (TypeError, ValueError):
+        return valor
+
+def campo_cantidad(contenedor, producto):
+    """Campo de cantidad según la unidad del producto: con decimales o entero."""
+    unidad = unidad_de(producto)
+    etiqueta = f"Cantidad ({plural(unidad)})"
+    if unidad in UNIDADES_CON_DECIMALES:
+        return contenedor.number_input(etiqueta, min_value=0.01, value=1.0, step=0.5, format="%.2f")
+    return contenedor.number_input(etiqueta, min_value=1, step=1)
+
+def estado_stock(cantidad, minimo=None):
     """Etiqueta visual del nivel de existencias."""
-    if unidades <= 0:
+    if cantidad <= 0:
         return "🔴 Agotado"
-    if unidades <= STOCK_BAJO:
+    if cantidad <= (STOCK_BAJO if minimo is None else minimo):
         return "🟡 Bajo"
     return "🟢 Disponible"
 
@@ -203,7 +253,7 @@ def suma(df, columna):
 
 def get_data(sheet_name):
     """Obtiene datos de una hoja y los devuelve como DataFrame."""
-    records = sheets[sheet_name].get_all_records()
+    records = leer_registros(sheet_name)
     if not records:
         try:
             headers = sheets[sheet_name].row_values(1)
@@ -252,6 +302,9 @@ def actualizar_inventario():
     inventario_df['Producto'] = partes_sku.str[0]
     inventario_df['Talla'] = partes_sku.str[1]
     inventario_df['Stock Actual'] = inventario_df['Unidades Compradas'] - inventario_df['Unidades Salientes']
+    # Evita restos de coma flotante (0.30000000004) al trabajar con metros.
+    for col in ['Unidades Compradas', 'Unidades Salientes', 'Stock Actual']:
+        inventario_df[col] = inventario_df[col].round(2)
     inventario_df['Fecha Actualizacion'] = ahora()
 
     column_order = ["SKU", "Producto", "Talla", "Unidades Compradas", "Unidades Salientes", "Stock Actual", "Fecha Actualizacion"]
@@ -294,20 +347,29 @@ if opcion == "⚙️ Gestión":
         st.subheader("Añadir Nuevo Producto")
         with st.form("nuevo_producto_form", clear_on_submit=True):
             nombre = st.text_input("Nombre del Nuevo Producto")
-            tallas = st.text_input("Tallas Disponibles (separadas por coma, ej: S,M,L)")
-            precio = st.number_input("Precio de Venta por Defecto", min_value=0.0, format="%.2f")
-            costo = st.number_input("Costo de Compra por Defecto", min_value=0.0, format="%.2f")
+            tallas = st.text_input("Categoría (ej: TELA, ESPUMA, MADERA)", help="Si el producto tiene varias presentaciones, sepáralas con coma.")
+            unidad = st.selectbox("Unidad de medida", options=UNIDADES)
+            precio = st.number_input("Precio de Venta por unidad de medida", min_value=0.0, format="%.2f")
+            costo = st.number_input("Costo de Compra por unidad de medida", min_value=0.0, format="%.2f")
             if st.form_submit_button("Añadir Producto", type="primary"):
                 nombre, tallas = nombre.strip(), tallas.strip()
                 if nombre and tallas:
-                    sheets["productos"].append_row([nombre, tallas, precio, costo])
-                    avisar(f"¡Producto '{nombre}' añadido!")
+                    # La fila se arma según los encabezados reales de la hoja.
+                    valores = {'NombreProducto': nombre, 'TallasDisponibles': tallas, 'PrecioVentaDefecto': precio, 'CostoCompraDefecto': costo, 'Unidad': unidad}
+                    encabezados = sheets["productos"].row_values(1)
+                    sheets["productos"].append_row([valores.get(h, "") for h in encabezados])
+                    if 'Unidad' in encabezados:
+                        avisar(f"¡Producto '{nombre}' añadido!")
+                    else:
+                        avisar(f"Producto '{nombre}' añadido, pero sin unidad: falta la columna 'Unidad' en la pestaña Productos.")
                     st.cache_data.clear()
                     st.rerun()
                 else:
-                    st.warning("Nombre y Tallas son campos obligatorios.")
+                    st.warning("Nombre y Categoría son campos obligatorios.")
+        if 'Unidad' not in productos_df.columns:
+            st.warning("La pestaña Productos no tiene la columna 'Unidad'. Agrégala en Google Sheets para manejar metros y láminas; mientras tanto todo se cuenta en unidades enteras.")
         st.subheader("Lista de Productos Actual")
-        tabla(productos_df, dinero=['PrecioVentaDefecto', 'CostoCompraDefecto'])
+        tabla(productos_df, dinero=['PrecioVentaDefecto', 'CostoCompraDefecto'], cantidad=['StockMinimo'])
 
     with tab2:
         st.subheader("Añadir Nuevo Cliente")
@@ -369,12 +431,12 @@ elif opcion == "💰 Registrar Venta":
                 precio_defecto = float(productos_df[productos_df['NombreProducto'] == producto_vendido]['PrecioVentaDefecto'].iloc[0])
 
                 c1, c2, c3 = st.columns(3)
-                talla_vendida = c1.selectbox("Talla", options=PRODUCTOS.get(producto_vendido, []))
-                cantidad_vendida = c2.number_input("Cantidad", min_value=1, step=1)
-                precio_unitario = c3.number_input("Precio Unitario ($)", min_value=0.0, value=precio_defecto, format="%.2f", key=f"precio_venta_{producto_vendido}")
+                talla_vendida = c1.selectbox("Categoría", options=PRODUCTOS.get(producto_vendido, []))
+                cantidad_vendida = campo_cantidad(c2, producto_vendido)
+                precio_unitario = c3.number_input(f"Precio por {unidad_de(producto_vendido).lower()} ($)", min_value=0.0, value=precio_defecto, format="%.2f", key=f"precio_venta_{producto_vendido}")
 
                 if st.form_submit_button("➕ Añadir Producto"):
-                    item = {"Producto": producto_vendido, "Talla": talla_vendida, "Cantidad": cantidad_vendida, "Precio Unitario": precio_unitario, "Total Venta": cantidad_vendida * precio_unitario}
+                    item = {"Producto": producto_vendido, "Talla": talla_vendida, "Cantidad": cantidad_vendida, "Unidad": unidad_de(producto_vendido), "Precio Unitario": precio_unitario, "Total Venta": round(cantidad_vendida * precio_unitario, 2)}
                     st.session_state.venta_actual.append(item)
                     st.rerun()
 
@@ -384,7 +446,7 @@ elif opcion == "💰 Registrar Venta":
             tabla(pd.DataFrame(st.session_state.venta_actual), dinero=['Precio Unitario', 'Total Venta'])
 
             with st.form("eliminar_item_venta_form"):
-                indices_a_eliminar = st.multiselect("Selecciona productos para eliminar", options=range(len(st.session_state.venta_actual)), format_func=lambda i: f"{st.session_state.venta_actual[i]['Producto']} (Talla: {st.session_state.venta_actual[i]['Talla']})")
+                indices_a_eliminar = st.multiselect("Selecciona productos para eliminar", options=range(len(st.session_state.venta_actual)), format_func=lambda i: f"{st.session_state.venta_actual[i]['Producto']} ({fmt_cantidad(st.session_state.venta_actual[i]['Cantidad'])} {st.session_state.venta_actual[i]['Unidad'].lower()})")
                 if st.form_submit_button("🗑️ Eliminar Seleccionados"):
                     st.session_state.venta_actual = [item for i, item in enumerate(st.session_state.venta_actual) if i not in indices_a_eliminar]
                     st.rerun()
@@ -460,12 +522,12 @@ elif opcion == "🛒 Registrar Compra":
                 costo_defecto = float(productos_df[productos_df['NombreProducto'] == producto_comprado]['CostoCompraDefecto'].iloc[0])
 
                 c1, c2, c3 = st.columns(3)
-                talla_comprada = c1.selectbox("Talla", options=PRODUCTOS.get(producto_comprado, []))
-                cantidad_comprada = c2.number_input("Cantidad", min_value=1, step=1)
-                costo_unitario = c3.number_input("Costo Unitario ($)", min_value=0.0, value=costo_defecto, format="%.2f", key=f"costo_compra_{producto_comprado}")
+                talla_comprada = c1.selectbox("Categoría", options=PRODUCTOS.get(producto_comprado, []))
+                cantidad_comprada = campo_cantidad(c2, producto_comprado)
+                costo_unitario = c3.number_input(f"Costo por {unidad_de(producto_comprado).lower()} ($)", min_value=0.0, value=costo_defecto, format="%.2f", key=f"costo_compra_{producto_comprado}")
 
                 if st.form_submit_button("➕ Añadir Producto"):
-                    item = {"Producto": producto_comprado, "Talla": talla_comprada, "Cantidad": cantidad_comprada, "Costo Total": cantidad_comprada * costo_unitario}
+                    item = {"Producto": producto_comprado, "Talla": talla_comprada, "Cantidad": cantidad_comprada, "Unidad": unidad_de(producto_comprado), "Costo Total": round(cantidad_comprada * costo_unitario, 2)}
                     st.session_state.compra_actual.append(item)
                     st.rerun()
 
@@ -476,7 +538,7 @@ elif opcion == "🛒 Registrar Compra":
             st.metric("Total de la compra", fmt_dinero(sum(item["Costo Total"] for item in st.session_state.compra_actual)), border=True)
 
             with st.form("eliminar_item_compra_form"):
-                indices_a_eliminar = st.multiselect("Selecciona productos para eliminar", options=range(len(st.session_state.compra_actual)), format_func=lambda i: f"{st.session_state.compra_actual[i]['Producto']} (Talla: {st.session_state.compra_actual[i]['Talla']})")
+                indices_a_eliminar = st.multiselect("Selecciona productos para eliminar", options=range(len(st.session_state.compra_actual)), format_func=lambda i: f"{st.session_state.compra_actual[i]['Producto']} ({fmt_cantidad(st.session_state.compra_actual[i]['Cantidad'])} {st.session_state.compra_actual[i]['Unidad'].lower()})")
                 if st.form_submit_button("🗑️ Eliminar Seleccionados"):
                     st.session_state.compra_actual = [item for i, item in enumerate(st.session_state.compra_actual) if i not in indices_a_eliminar]
                     st.rerun()
@@ -513,15 +575,15 @@ elif opcion == "🎁 Registrar Obsequio":
 
     with st.form("obsequio_form", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
-        talla_obsequiada = c1.selectbox("Talla", options=PRODUCTOS.get(producto_obsequiado, []))
-        cantidad_obsequiada = c2.number_input("Cantidad", min_value=1, step=1)
+        talla_obsequiada = c1.selectbox("Categoría", options=PRODUCTOS.get(producto_obsequiado, []))
+        cantidad_obsequiada = campo_cantidad(c2, producto_obsequiado)
         motivo = c3.text_input("Motivo / Cliente")
 
         if st.form_submit_button("🎁 Registrar Obsequio", type="primary"):
             if producto_obsequiado and motivo:
                 with st.spinner("Registrando obsequio..."):
                     costo_unitario = float(productos_df[productos_df['NombreProducto'] == producto_obsequiado]['CostoCompraDefecto'].iloc[0])
-                    costo_total_obsequio = costo_unitario * cantidad_obsequiada
+                    costo_total_obsequio = round(costo_unitario * cantidad_obsequiada, 2)
 
                     id_obsequio = f"OBSEQUIO-{uuid.uuid4().hex[:8].upper()}"
                     fecha_obsequio = ahora()
@@ -794,18 +856,18 @@ elif opcion == "📈 Ver Inventario":
         for col in ['Unidades Compradas', 'Unidades Vendidas', 'Stock Actual']:
             if col in inventario_df.columns:
                 inventario_df[col] = pd.to_numeric(inventario_df[col], errors='coerce').fillna(0)
-        inventario_df['Estado'] = inventario_df['Stock Actual'].apply(estado_stock)
-        stock = inventario_df['Stock Actual']
+        inventario_df['Unidad'] = inventario_df['Producto'].map(unidad_de)
+        inventario_df['Estado'] = [estado_stock(cantidad, MINIMO_PRODUCTO.get(producto)) for cantidad, producto in zip(inventario_df['Stock Actual'], inventario_df['Producto'])]
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Referencias", len(inventario_df), border=True)
-        m2.metric("Unidades en stock", f"{int(stock.clip(lower=0).sum()):,}".replace(",", "."), border=True)
-        m3.metric("🟡 Stock bajo", int(((stock > 0) & (stock <= STOCK_BAJO)).sum()), border=True)
-        m4.metric("🔴 Agotados", int((stock <= 0).sum()), border=True)
+        m2.metric("🟢 Disponibles", int((inventario_df['Estado'] == "🟢 Disponible").sum()), border=True)
+        m3.metric("🟡 Stock bajo", int((inventario_df['Estado'] == "🟡 Bajo").sum()), border=True)
+        m4.metric("🔴 Agotados", int((inventario_df['Estado'] == "🔴 Agotado").sum()), border=True)
 
         f1, f2, f3 = st.columns([3, 2, 2])
         busqueda = f1.text_input("Buscar producto", placeholder="Escribe parte del nombre...")
-        categorias = f2.multiselect("Categoría / Talla", options=sorted(inventario_df['Talla'].astype(str).unique()))
+        categorias = f2.multiselect("Categoría", options=sorted(inventario_df['Talla'].astype(str).unique()))
         estados = f3.multiselect("Estado", options=["🟢 Disponible", "🟡 Bajo", "🔴 Agotado"])
 
         vista = inventario_df
@@ -816,17 +878,18 @@ elif opcion == "📈 Ver Inventario":
         if estados:
             vista = vista[vista['Estado'].isin(estados)]
 
-        columnas = [c for c in ['Producto', 'Talla', 'Estado', 'Stock Actual', 'Unidades Compradas', 'Unidades Vendidas', 'Fecha Actualizacion'] if c in vista.columns]
+        columnas = [c for c in ['Producto', 'Talla', 'Estado', 'Stock Actual', 'Unidad', 'Unidades Compradas', 'Unidades Vendidas', 'Fecha Actualizacion'] if c in vista.columns]
+        numericas = [c for c in ['Stock Actual', 'Unidades Compradas', 'Unidades Vendidas'] if c in columnas]
         st.dataframe(
-            vista[columnas].sort_values('Producto'),
+            vista[columnas].sort_values('Producto').style.format({c: fmt_cantidad for c in numericas}),
             width="stretch",
             hide_index=True,
             column_config={
-                'Talla': st.column_config.TextColumn("Categoría / Talla"),
-                'Stock Actual': st.column_config.NumberColumn("Stock", format="%d"),
-                'Unidades Compradas': st.column_config.NumberColumn("Compradas", format="%d"),
-                'Unidades Vendidas': st.column_config.NumberColumn("Vendidas", format="%d"),
-                'Fecha Actualizacion': st.column_config.TextColumn("Actualizado"),
+                'Talla': st.column_config.Column("Categoría"),
+                'Stock Actual': st.column_config.Column("Stock"),
+                'Unidades Compradas': st.column_config.Column("Comprado"),
+                'Unidades Vendidas': st.column_config.Column("Vendido"),
+                'Fecha Actualizacion': st.column_config.Column("Actualizado"),
             },
         )
         st.caption(f"Mostrando {len(vista)} de {len(inventario_df)} referencias.")

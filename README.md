@@ -130,7 +130,7 @@ Crea estas 8 pestañas (los nombres deben coincidir LETRA POR LETRA, mayúsculas
 
 | # | Nombre de la pestaña | Encabezados (fila 1) |
 |---|---|---|
-| 1 | `Productos` | `NombreProducto` · `TallasDisponibles` · `PrecioVentaDefecto` · `CostoCompraDefecto` |
+| 1 | `Productos` | `NombreProducto` · `TallasDisponibles` · `PrecioVentaDefecto` · `CostoCompraDefecto` · `Unidad` · `StockMinimo` (opcional) |
 | 2 | `Clientes` | `NombreCliente` |
 | 3 | `Proveedores` | `NombreProveedor` |
 | 4 | `Ventas` | `ID Venta` · `Fecha` · `Producto` · `Talla` · `Cliente` · `Cantidad` · `Precio Unitario` · `Total Venta` · `Estado Pago` |
@@ -141,7 +141,11 @@ Crea estas 8 pestañas (los nombres deben coincidir LETRA POR LETRA, mayúsculas
 
 > 🔑 Los **nombres de las columnas son sensibles a mayúsculas, espacios y tildes**. Cópialos tal cual aparecen.
 
-> 💡 La pestaña `Productos` no acepta tallas con espacios al inicio/final. Las tallas se separan por coma, ejemplo: `S,M,L,XL`.
+> 💡 En la app, `TallasDisponibles` y `Talla` se muestran como **Categoría** (ej: `TELA`, `ESPUMA`, `MADERA`). Los nombres de las columnas en la hoja no se cambian.
+>
+> 💡 `Unidad` es la unidad de medida de cada producto: `Metro`, `Lámina` o `Unidad` (la lista se edita en `UNIDADES`, al inicio de `app.py`). Los productos en `Metro` aceptan cantidades con decimales (2,5); los demás solo enteros. `PrecioVentaDefecto` y `CostoCompraDefecto` son el precio y el costo **por esa unidad**.
+>
+> 💡 `StockMinimo` es opcional: la cantidad a partir de la cual el producto se marca con "stock bajo". Si está vacío se usa `STOCK_BAJO` de `app.py`.
 
 ---
 
